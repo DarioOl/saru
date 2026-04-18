@@ -1,0 +1,20 @@
+{
+  "name": "Claude (API)",
+  "short_name": "Claude",
+  "description": "Client mobile Claude utilisant votre clé API Anthropic.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "lang": "fr",
+  "icons": [
+    {
+      "src": "assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
