@@ -18,6 +18,9 @@
 
 * { box-sizing: border-box; }
 
+/* L'attribut HTML `hidden` doit toujours masquer l'élément, même si .screen/.modal forcent display:flex */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

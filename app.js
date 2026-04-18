@@ -951,6 +951,14 @@ document.addEventListener('click', (e) => {
   }
 });
 
+// Échap pour fermer modales/sidebar
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    if (!modelModal.hidden || !settingsModal.hidden) closeModals();
+    else if (!sidebar.hidden) closeSidebar();
+  }
+});
+
 // ---------- Boot ----------
 (function boot() {
   renderModelLabel();
