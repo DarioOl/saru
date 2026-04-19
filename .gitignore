@@ -4,3 +4,5 @@ node_modules/
 .vscode/
 .idea/
 *.log
+.playwright-mcp/
+export-mode-mobile.png

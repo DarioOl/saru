@@ -142,6 +142,8 @@ const state = {
   streaming: false,
   abortCtrl: null,
   locked: !!lsGet(LS.LOCKED, false), // bloqué par erreur API
+  exportMode: false,
+  exportSelected: new Set(), // indices de messages sélectionnés dans la conv courante
 };
 
 // ---------- DOM ----------
@@ -185,6 +187,16 @@ const changeKeyBtn = $('#change-key-btn');
 const changePinBtn = $('#change-pin-btn');
 const wipeBtn = $('#wipe-btn');
 const toastEl = $('#toast');
+const micBtn = $('#mic-btn');
+const composerEl = document.querySelector('.composer');
+const exportBtn = $('#export-btn');
+const exportBanner = $('#export-banner');
+const exportCountEl = $('#export-count');
+const exportToggleAllBtn = $('#export-toggle-all');
+const exportActions = $('#export-actions');
+const exportCancelBtn = $('#export-cancel');
+const exportCopyBtn = $('#export-copy');
+const exportShareBtn = $('#export-share');
 
 // ---------- Toast ----------
 let toastTimer;
@@ -225,6 +237,7 @@ function deleteConversation(id) {
   state.conversations = state.conversations.filter((c) => c.id !== id);
   saveConversations();
   if (state.currentConvId === id) {
+    if (state.exportMode) exitExportMode();
     state.currentConvId = state.conversations[0]?.id || null;
     lsSet(LS.CURRENT_CONV, state.currentConvId);
   }
@@ -233,6 +246,7 @@ function deleteConversation(id) {
   renderTitle();
 }
 function selectConversation(id) {
+  if (state.exportMode) exitExportMode();
   state.currentConvId = id;
   lsSet(LS.CURRENT_CONV, id);
   renderChat();
@@ -289,15 +303,27 @@ function renderChat() {
     chatEl.appendChild(empty);
     return;
   }
-  for (const msg of conv.messages) {
-    chatEl.appendChild(buildMsgEl(msg));
-  }
+  conv.messages.forEach((msg, index) => {
+    chatEl.appendChild(buildMsgEl(msg, index));
+  });
   scrollToBottom();
 }
 
-function buildMsgEl(msg) {
+function buildMsgEl(msg, index) {
   const el = document.createElement('div');
   el.className = `msg ${msg.role}`;
+  const canSelect = state.exportMode && msg.role !== 'error' && (msg.text || msg.images?.length);
+  if (canSelect) {
+    el.classList.add('selectable');
+    if (state.exportSelected.has(index)) el.classList.add('selected');
+    el.addEventListener('click', (e) => {
+      // Ne pas déclencher si on sélectionne du texte (sélection > 0 caractères)
+      const sel = window.getSelection();
+      if (sel && sel.toString().length > 0) return;
+      e.preventDefault();
+      toggleMessageSelection(index);
+    });
+  }
   if (msg.role === 'error') {
     const b = document.createElement('div');
     b.className = 'msg-bubble';
@@ -477,6 +503,175 @@ async function* streamFromAnthropic({ apiKey, model, messages, system, maxTokens
   }
 }
 
+// ---------- Reconnaissance vocale (Web Speech API) ----------
+// Fonctionne nativement sur Chrome Android et Safari iOS (14.5+).
+// Insère la transcription dans le composer, avec résultats intermédiaires.
+const SpeechRecognitionCtor =
+  window.SpeechRecognition || window.webkitSpeechRecognition || null;
+
+const speech = {
+  recognition: null,
+  recording: false,
+  // Texte déjà présent dans le textarea avant de démarrer / position du curseur
+  baseText: '',
+  insertAt: 0,
+  // Portion finalisée accumulée pendant cette session
+  finalBuf: '',
+};
+
+function speechSupported() {
+  return !!SpeechRecognitionCtor;
+}
+
+function createRecognition() {
+  const rec = new SpeechRecognitionCtor();
+  rec.lang = 'fr-FR';
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+
+  rec.onresult = (event) => {
+    let interim = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      const transcript = res[0].transcript;
+      if (res.isFinal) {
+        speech.finalBuf += (speech.finalBuf && !/\s$/.test(speech.finalBuf) ? ' ' : '') + transcript.trim();
+      } else {
+        interim += transcript;
+      }
+    }
+    updateComposerFromSpeech(interim);
+  };
+
+  rec.onerror = (event) => {
+    console.warn('SpeechRecognition error:', event.error);
+    switch (event.error) {
+      case 'not-allowed':
+      case 'service-not-allowed':
+        toast('Accès au micro refusé. Autorise-le dans les réglages du navigateur.', { error: true, duration: 4500 });
+        break;
+      case 'no-speech':
+        // Silencieux : déclenché si rien n'est détecté, on laisse l'utilisateur réessayer
+        break;
+      case 'audio-capture':
+        toast('Aucun micro détecté.', { error: true });
+        break;
+      case 'network':
+        toast('Problème réseau pendant la reconnaissance vocale.', { error: true });
+        break;
+      case 'aborted':
+        break;
+      default:
+        toast('Erreur micro : ' + event.error, { error: true });
+    }
+  };
+
+  rec.onend = () => {
+    // Peut se déclencher automatiquement (timeout navigateur). On commit proprement.
+    finishRecording();
+  };
+
+  return rec;
+}
+
+function updateComposerFromSpeech(interim) {
+  const combined = (speech.finalBuf + (interim ? (speech.finalBuf ? ' ' : '') + interim : '')).trim();
+  const before = speech.baseText.slice(0, speech.insertAt);
+  const after = speech.baseText.slice(speech.insertAt);
+  // On insère avec un espace si nécessaire pour ne pas coller aux mots existants
+  const sep1 = before && !/\s$/.test(before) && combined ? ' ' : '';
+  const sep2 = after && !/^\s/.test(after) && combined ? ' ' : '';
+  composerInput.value = before + sep1 + combined + sep2 + after;
+  autoResizeComposer();
+  updateSendState();
+}
+
+async function startRecording() {
+  if (!speechSupported()) {
+    toast('La reconnaissance vocale n\'est pas supportée sur ce navigateur.', { error: true, duration: 4000 });
+    return;
+  }
+  if (speech.recording) return;
+
+  // Sur iOS/Android il faut souvent demander explicitement le micro pour que la permission persiste
+  try {
+    if (navigator.mediaDevices?.getUserMedia) {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // On relâche tout de suite : SpeechRecognition réouvre son propre flux
+      stream.getTracks().forEach((t) => t.stop());
+    }
+  } catch (err) {
+    console.warn('getUserMedia denied:', err);
+    toast('Accès au micro refusé.', { error: true, duration: 4000 });
+    return;
+  }
+
+  speech.baseText = composerInput.value;
+  speech.insertAt =
+    typeof composerInput.selectionStart === 'number'
+      ? composerInput.selectionStart
+      : composerInput.value.length;
+  speech.finalBuf = '';
+
+  speech.recognition = createRecognition();
+  try {
+    speech.recognition.start();
+  } catch (err) {
+    console.warn('recognition.start failed', err);
+    toast('Impossible de démarrer le micro.', { error: true });
+    return;
+  }
+
+  speech.recording = true;
+  micBtn.classList.add('recording');
+  micBtn.setAttribute('aria-pressed', 'true');
+  micBtn.setAttribute('aria-label', 'Arrêter la dictée');
+  composerEl?.classList.add('is-recording');
+}
+
+function stopRecording() {
+  if (!speech.recording || !speech.recognition) return;
+  try {
+    speech.recognition.stop();
+  } catch {}
+  // finishRecording() sera appelé par onend
+}
+
+function finishRecording() {
+  speech.recording = false;
+  speech.recognition = null;
+  micBtn.classList.remove('recording');
+  micBtn.setAttribute('aria-pressed', 'false');
+  micBtn.setAttribute('aria-label', 'Dicter au micro');
+  composerEl?.classList.remove('is-recording');
+  // Replace le curseur à la fin du texte inséré
+  const insertedLen = speech.finalBuf.length;
+  if (insertedLen > 0) {
+    const newPos = speech.insertAt + insertedLen + 1;
+    try {
+      composerInput.focus();
+      composerInput.setSelectionRange(
+        Math.min(newPos, composerInput.value.length),
+        Math.min(newPos, composerInput.value.length),
+      );
+    } catch {}
+  }
+  speech.finalBuf = '';
+}
+
+function toggleRecording() {
+  if (speech.recording) stopRecording();
+  else startRecording();
+}
+
+// Masque le bouton si non supporté
+if (!speechSupported()) {
+  micBtn.hidden = true;
+}
+
+micBtn.addEventListener('click', toggleRecording);
+
 // ---------- Envoi message ----------
 async function sendMessage() {
   if (state.streaming) return;
@@ -484,6 +679,7 @@ async function sendMessage() {
     toast('App verrouillée par sécurité. Change ta clé API.', { error: true });
     return;
   }
+  if (speech.recording) stopRecording();
   const text = composerInput.value.trim();
   if (!text && state.attachments.length === 0) return;
 
@@ -658,6 +854,9 @@ function renderAttachments() {
 function updateSendState() {
   const hasContent = composerInput.value.trim() || state.attachments.length > 0;
   sendBtn.disabled = !hasContent || state.streaming || state.locked;
+  if (micBtn && !micBtn.hidden) {
+    micBtn.disabled = state.streaming || state.locked;
+  }
 }
 
 function autoResizeComposer() {
@@ -695,6 +894,194 @@ function closeModals() {
   modelModal.hidden = true;
   settingsModal.hidden = true;
 }
+
+// ---------- Export / envoi par mail ----------
+function enterExportMode() {
+  const conv = getCurrentConv();
+  if (!conv || conv.messages.length === 0) {
+    toast('Aucun message à exporter', { error: true });
+    return;
+  }
+  state.exportMode = true;
+  // Pré-sélectionne tous les messages exportables
+  state.exportSelected = new Set();
+  conv.messages.forEach((m, i) => {
+    if (m.role !== 'error' && (m.text || m.images?.length)) {
+      state.exportSelected.add(i);
+    }
+  });
+  exportBanner.hidden = false;
+  exportActions.hidden = false;
+  composerEl.hidden = true;
+  attachmentsEl.hidden = true;
+  // Stoppe dictée et streaming si besoin
+  if (speech.recording) stopRecording();
+  renderChat();
+  updateExportUI();
+}
+
+function exitExportMode() {
+  state.exportMode = false;
+  state.exportSelected.clear();
+  exportBanner.hidden = true;
+  exportActions.hidden = true;
+  composerEl.hidden = false;
+  if (state.attachments.length > 0) attachmentsEl.hidden = false;
+  renderChat();
+}
+
+function toggleMessageSelection(index) {
+  if (state.exportSelected.has(index)) state.exportSelected.delete(index);
+  else state.exportSelected.add(index);
+  const el = chatEl.children[index];
+  if (el) el.classList.toggle('selected', state.exportSelected.has(index));
+  updateExportUI();
+}
+
+function countExportableMessages(conv) {
+  return conv.messages.reduce((n, m) => {
+    return n + (m.role !== 'error' && (m.text || m.images?.length) ? 1 : 0);
+  }, 0);
+}
+
+function updateExportUI() {
+  const n = state.exportSelected.size;
+  exportCountEl.textContent = n === 0
+    ? 'Aucun message sélectionné'
+    : `${n} message${n > 1 ? 's' : ''} sélectionné${n > 1 ? 's' : ''}`;
+  const conv = getCurrentConv();
+  const total = conv ? countExportableMessages(conv) : 0;
+  exportToggleAllBtn.textContent = n >= total ? 'Tout désélectionner' : 'Tout sélectionner';
+  exportCopyBtn.disabled = n === 0;
+  exportShareBtn.disabled = n === 0;
+}
+
+function toggleSelectAll() {
+  const conv = getCurrentConv();
+  if (!conv) return;
+  const total = countExportableMessages(conv);
+  if (state.exportSelected.size >= total) {
+    state.exportSelected.clear();
+  } else {
+    state.exportSelected = new Set();
+    conv.messages.forEach((m, i) => {
+      if (m.role !== 'error' && (m.text || m.images?.length)) {
+        state.exportSelected.add(i);
+      }
+    });
+  }
+  renderChat();
+  updateExportUI();
+}
+
+function formatExportText(conv, indices) {
+  const modelName = MODELS.find((m) => m.id === conv.model)?.name || conv.model || '—';
+  const date = new Date(conv.updatedAt || Date.now()).toLocaleString('fr-FR', {
+    dateStyle: 'long', timeStyle: 'short',
+  });
+  const sorted = [...indices].sort((a, b) => a - b);
+  const parts = [];
+  parts.push(`Conversation : ${conv.title || 'Sans titre'}`);
+  parts.push(`Modèle : ${modelName}`);
+  parts.push(`Date : ${date}`);
+  parts.push('');
+  parts.push('───────────────');
+  parts.push('');
+  for (const i of sorted) {
+    const m = conv.messages[i];
+    if (!m || m.role === 'error') continue;
+    const label = m.role === 'user' ? 'Moi' : 'Claude';
+    parts.push(`${label} :`);
+    if (m.images?.length) parts.push(`[${m.images.length} image(s) jointe(s)]`);
+    if (m.text) parts.push(m.text);
+    parts.push('');
+    parts.push('───────────────');
+    parts.push('');
+  }
+  return parts.join('\n').trimEnd() + '\n';
+}
+
+async function copyToClipboard(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function doExportCopy() {
+  const conv = getCurrentConv();
+  if (!conv || state.exportSelected.size === 0) return;
+  const text = formatExportText(conv, state.exportSelected);
+  const ok = await copyToClipboard(text);
+  if (ok) {
+    toast('Copié dans le presse-papier', { duration: 2000 });
+    // Astuce : on ne quitte pas le mode export, l'utilisateur peut encore partager
+  } else {
+    toast('Impossible de copier', { error: true });
+  }
+}
+
+async function doExportShare() {
+  const conv = getCurrentConv();
+  if (!conv || state.exportSelected.size === 0) return;
+  const text = formatExportText(conv, state.exportSelected);
+  const title = `Conversation Claude — ${conv.title || 'Sans titre'}`;
+
+  // 1) Web Share API : ouvre la feuille de partage native (Mail, Messages, Notes…)
+  if (navigator.share) {
+    try {
+      await navigator.share({ title, text });
+      toast('Partagé', { duration: 1500 });
+      exitExportMode();
+      return;
+    } catch (err) {
+      if (err?.name === 'AbortError') return; // utilisateur a annulé
+      // sinon on retombe sur le fallback mailto
+      console.warn('share failed, fallback to mailto', err);
+    }
+  }
+
+  // 2) Fallback : mailto — attention à la limite de taille (~2 Ko sur certains clients)
+  const MAX_MAILTO = 1800;
+  let body = text;
+  let truncated = false;
+  if (body.length > MAX_MAILTO) {
+    body = body.slice(0, MAX_MAILTO) + '\n\n[…message tronqué — utilise « Copier » pour le texte complet…]';
+    truncated = true;
+  }
+  const url = `mailto:?subject=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+  window.location.href = url;
+  if (truncated) {
+    toast('Mail trop long : utilise « Copier » pour le texte complet', { error: true, duration: 4500 });
+  } else {
+    setTimeout(() => exitExportMode(), 300);
+  }
+}
+
+exportBtn.addEventListener('click', () => {
+  closeSidebar();
+  enterExportMode();
+});
+exportCancelBtn.addEventListener('click', exitExportMode);
+exportToggleAllBtn.addEventListener('click', toggleSelectAll);
+exportCopyBtn.addEventListener('click', doExportCopy);
+exportShareBtn.addEventListener('click', doExportShare);
 
 // ---------- PIN / unlock flow ----------
 function hasEncKey() { return !!lsGet(LS.ENC_KEY, null); }
@@ -909,7 +1296,10 @@ composerInput.addEventListener('paste', async (e) => {
 });
 
 modelPicker.addEventListener('click', openModelPicker);
-newChatBtn.addEventListener('click', () => { newConversation(); });
+newChatBtn.addEventListener('click', () => {
+  if (state.exportMode) exitExportMode();
+  newConversation();
+});
 menuBtn.addEventListener('click', openSidebar);
 settingsBtn.addEventListener('click', () => { closeSidebar(); openSettings(); });
 lockBtn.addEventListener('click', () => {
@@ -956,6 +1346,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!modelModal.hidden || !settingsModal.hidden) closeModals();
     else if (!sidebar.hidden) closeSidebar();
+    else if (state.exportMode) exitExportMode();
   }
 });
 

@@ -2,7 +2,7 @@
 // Cache l'app shell pour le mode hors-ligne (l'API Anthropic, elle,
 // nécessite forcément le réseau donc rien n'est caché des requêtes vers api.anthropic.com).
 
-const CACHE_NAME = 'claude-pwa-v1';
+const CACHE_NAME = 'claude-pwa-v2';
 const ASSETS = [
   './',
   './index.html',

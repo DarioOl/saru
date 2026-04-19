@@ -108,9 +108,26 @@
       </button>
     </header>
 
+    <div id="export-banner" class="export-banner" hidden>
+      <span id="export-count" class="export-count">0 message sélectionné</span>
+      <button id="export-toggle-all" class="btn-link" type="button">Tout sélectionner</button>
+    </div>
+
     <main id="chat" class="chat" role="log" aria-live="polite"></main>
 
     <div id="attachments" class="attachments" hidden></div>
+
+    <footer id="export-actions" class="export-actions" hidden>
+      <button id="export-cancel" class="btn-ghost" type="button">Annuler</button>
+      <button id="export-copy" class="btn-ghost" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        Copier
+      </button>
+      <button id="export-share" class="btn btn-primary" type="button">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+        Envoyer
+      </button>
+    </footer>
 
     <footer class="composer">
       <button id="attach-btn" class="icon-btn" aria-label="Joindre une image" type="button">
@@ -125,6 +142,10 @@
         autocomplete="off"
         spellcheck="true"
       ></textarea>
+
+      <button id="mic-btn" class="icon-btn mic-btn" aria-label="Dicter au micro" type="button" aria-pressed="false">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+      </button>
 
       <button id="send-btn" class="send-btn" aria-label="Envoyer" disabled>
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
@@ -147,6 +168,7 @@
       </div>
       <ul id="conv-list" class="conv-list"></ul>
       <div class="sidebar-footer">
+        <button id="export-btn" class="btn-ghost" type="button">Exporter</button>
         <button id="settings-btn" class="btn-ghost" type="button">Paramètres</button>
         <button id="lock-btn" class="btn-ghost" type="button">Verrouiller</button>
       </div>
