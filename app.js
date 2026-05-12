@@ -124,16 +124,127 @@ function lsGet(key, fallback = null) {
   }
 }
 function lsSet(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    // localStorage est petit (~5 Mo). On n'y stocke plus que des petites clés ;
+    // les conversations sont dans IndexedDB. Si malgré tout ça déborde, on prévient.
+    console.warn('localStorage.setItem failed for', key, err);
+  }
 }
 function lsDel(key) {
   localStorage.removeItem(key);
 }
 
+// ---------- IndexedDB (conversations) ----------
+// localStorage est limité à ~5 Mo : les conversations contenant des images
+// (base64) dépassent vite ce quota. On bascule donc dans IndexedDB qui
+// offre généralement plusieurs Go de stockage par origine.
+const IDB_NAME = 'claude_pwa';
+const IDB_STORE = 'kv';
+const IDB_KEY_CONVS = 'conversations';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function idbGet(key) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function idbSet(key, value) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  }));
+}
+
+function idbClear() {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  })).catch(() => {});
+}
+
+async function loadConversationsFromStorage() {
+  let convs = null;
+  try {
+    const fromIdb = await idbGet(IDB_KEY_CONVS);
+    if (Array.isArray(fromIdb)) convs = fromIdb;
+  } catch (e) {
+    console.warn('IDB read failed', e);
+  }
+  // Migration depuis l'ancien stockage localStorage (et libère la place)
+  let legacy = null;
+  try { legacy = lsGet(LS.CONVS, null); } catch {}
+  if (Array.isArray(legacy) && legacy.length) {
+    if (!convs || convs.length === 0) {
+      convs = legacy;
+    } else {
+      const seen = new Set(convs.map((c) => c.id));
+      for (const c of legacy) if (!seen.has(c.id)) convs.push(c);
+    }
+    try {
+      await idbSet(IDB_KEY_CONVS, convs);
+      lsDel(LS.CONVS);
+    } catch (e) {
+      console.warn('IDB migration save failed', e);
+    }
+  }
+  return Array.isArray(convs) ? convs : [];
+}
+
+let _saveConvsTimer = null;
+let _saveConvsPending = false;
+let _saveConvsInFlight = null;
+function saveConversations() {
+  // Coalesce les écritures (utile pendant le streaming).
+  _saveConvsPending = true;
+  if (_saveConvsTimer) return;
+  _saveConvsTimer = setTimeout(async () => {
+    _saveConvsTimer = null;
+    while (_saveConvsPending) {
+      _saveConvsPending = false;
+      const snapshot = state.conversations;
+      _saveConvsInFlight = idbSet(IDB_KEY_CONVS, snapshot).catch((e) => {
+        console.error('Save conversations failed', e);
+        toast('Erreur de sauvegarde : ' + (e?.message || e), { error: true, duration: 4000 });
+      });
+      await _saveConvsInFlight;
+      _saveConvsInFlight = null;
+    }
+  }, 250);
+}
+
+async function wipeAllData() {
+  try { await idbClear(); } catch {}
+  try { localStorage.clear(); } catch {}
+}
+
 // ---------- État global ----------
 const state = {
   apiKey: null,          // clé déchiffrée en mémoire uniquement
-  conversations: lsGet(LS.CONVS, []),
+  conversations: [],     // peuplé de façon asynchrone au boot via IndexedDB
   currentConvId: lsGet(LS.CURRENT_CONV, null),
   modelId: lsGet(LS.MODEL, DEFAULT_MODEL_ID),
   systemPrompt: lsGet(LS.SYSTEM_PROMPT, ''),
@@ -211,9 +322,6 @@ function toast(msg, { error = false, duration = 2500 } = {}) {
 // ---------- Conversations ----------
 function getCurrentConv() {
   return state.conversations.find((c) => c.id === state.currentConvId) || null;
-}
-function saveConversations() {
-  lsSet(LS.CONVS, state.conversations);
 }
 function newConversation() {
   const conv = {
@@ -1209,9 +1317,9 @@ function enterApp() {
   }
 }
 
-resetAppBtn.addEventListener('click', () => {
+resetAppBtn.addEventListener('click', async () => {
   if (confirm('Effacer toutes les données (clé API + conversations) ?')) {
-    localStorage.clear();
+    await wipeAllData();
     location.reload();
   }
 });
@@ -1310,9 +1418,9 @@ lockBtn.addEventListener('click', () => {
 
 changeKeyBtn.addEventListener('click', promptChangeApiKey);
 changePinBtn.addEventListener('click', promptChangePin);
-wipeBtn.addEventListener('click', () => {
+wipeBtn.addEventListener('click', async () => {
   if (confirm('Effacer toutes les données (clé API + conversations + paramètres) ?')) {
-    localStorage.clear();
+    await wipeAllData();
     location.reload();
   }
 });
@@ -1351,7 +1459,17 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ---------- Boot ----------
-(function boot() {
+(async function boot() {
   renderModelLabel();
+  // Demande un stockage persistant pour éviter l'éviction par le navigateur.
+  if (navigator.storage && navigator.storage.persist) {
+    navigator.storage.persist().catch(() => {});
+  }
+  try {
+    state.conversations = await loadConversationsFromStorage();
+  } catch (e) {
+    console.error('Failed to load conversations', e);
+    state.conversations = [];
+  }
   initUnlockFlow();
 })();
